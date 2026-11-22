@@ -7,3 +7,5 @@ duckdb
 pymupdf
 python-docx
 python-dateutil
+sentence-transformers
+numpy

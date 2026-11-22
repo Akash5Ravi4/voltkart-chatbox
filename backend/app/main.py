@@ -12,6 +12,7 @@ from app.tables import (
     make_table_name, load_csv, drop_table, describe_tables, run_query,
 )
 from app.docs import ingest_document
+from app.search import search_documents, embed_missing
 
 init_db()
 
@@ -189,10 +190,25 @@ async def upload_file(file: UploadFile = File(...)):
             "INSERT INTO csv_tables (file_id, table_name, row_count) VALUES (?, ?, ?)",
             (file_id, info["table_name"], info["rows"]),
         )
+        
         conn.commit()
         result.update(
             table_name=info["table_name"], rows=info["rows"], columns=info["columns"]
         )
+    if file_type in ("pdf", "docx", "txt"):
+        try:
+            info = ingest_document(conn, file_id, stored_path, file_type, safe_name)
+            conn.commit()
+            embed_missing(conn)  # new line: embeds the chunks we just saved
+        except Exception as e:
+            remove_file(conn, file_id)
+            conn.close()
+            raise HTTPException(status_code=400, detail=f"Could not read document: {e}")
+        result.update(info)
+
+    conn.close()
+    return result    
+
     if file_type in ("pdf", "docx", "txt"):
         try:
             info = ingest_document(conn, file_id, stored_path, file_type, safe_name)
@@ -265,3 +281,12 @@ def document_chunks(file_id: int):
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+@app.get("/search")
+def search_test(q: str, top_k: int = 6):
+    """Dev/test route: search the uploaded documents."""
+    conn = get_conn()
+    try:
+        return search_documents(conn, q, top_k)
+    finally:
+        conn.close()

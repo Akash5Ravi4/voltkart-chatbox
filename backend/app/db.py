@@ -68,6 +68,9 @@ def init_db() -> None:
         );
         """
     )
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()]
+    if "embedding" not in cols:
+        conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB")
     conn.commit()
     conn.close()
      

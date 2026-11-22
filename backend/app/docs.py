@@ -4,6 +4,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 import fitz  # pymupdf
+import pymupdf
 from dateutil import parser as dateparser
 from docx import Document
 from docx.table import Table
