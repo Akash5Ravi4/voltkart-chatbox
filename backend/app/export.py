@@ -177,18 +177,14 @@ def citation_flowables(c: dict, st: dict, width: float) -> list:
             total = c.get("row_count", len(rows))
             if total > len(rows):
                 out.append(Paragraph(f"Showing {len(rows)} of {total} rows", st["small"]))
-    else:
-        out.append(Paragraph(esc(f"[{c.get('ref')}] {c.get('file_name', '')}"), st["cite_title"]))
-        status = "latest version" if c.get("status") == "latest" else "older version"
-        meta = (
-            f"Document date: {c.get('doc_date') or 'unknown'} | "
-            f"Section: {c.get('location', '')} | {status}"
-        )
-        out.append(Paragraph(esc(meta), st["cite_meta"]))
+    elif c.get("type") == "web":
+        out.append(Paragraph(esc(f"[{c.get('ref')}] Web - {c.get('title', '')}"), st["cite_title"]))
+        out.append(Paragraph(esc(c.get("url", "")), st["cite_meta"]))
         text = (c.get("text") or "").strip()
-        if len(text) > 800:
-            text = text[:800] + "..."
-        out.append(Paragraph(esc(text).replace("\n", "<br/>"), st["quote"]))
+        if len(text) > 500:
+            text = text[:500] + "..."
+        if text:
+            out.append(Paragraph(esc(text).replace("\n", "<br/>"), st["quote"]))
     return out
 
 
@@ -236,8 +232,13 @@ def build_chat_pdf(chat: dict, messages: list[dict], tz_minutes: int = 0) -> byt
         is_user = m["role"] == "user"
         who = "You" if is_user else "Assistant"
         when = esc(fmt_time(m["created_at"], tz_minutes))
+        ws = m.get("web_search")
+        web = "" if ws is None else f" | Web search: {'ON' if ws else 'OFF'}"
         story.append(
-            Paragraph(f"{who} <font color='#6b6b70' size='8'>&nbsp;&nbsp;{when}</font>", st["who"])
+            Paragraph(
+                f"{who} <font color='#6b6b70' size='8'>&nbsp;&nbsp;{when}{web}</font>",
+                st["who"],
+            )
         )
         story.extend(markdown_flowables(m["content"], st, width))
 

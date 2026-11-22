@@ -74,7 +74,8 @@ def init_db() -> None:
     mcols = [r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
     if "charts" not in mcols:
         conn.execute("ALTER TABLE messages ADD COLUMN charts TEXT")
-
+    if "web_search" not in mcols:
+        conn.execute("ALTER TABLE messages ADD COLUMN web_search INTEGER")
     conn.commit()
     conn.close()
      

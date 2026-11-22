@@ -32,7 +32,10 @@ HISTORY_LIMIT = 20  # how many recent messages we send to the LLM
 class ChatRequest(BaseModel):
     content: str
 
-
+class ChatRequest(BaseModel):
+    content: str
+    web_search: bool = False
+    
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -75,7 +78,7 @@ def export_chat(chat_id: int, tz: int = 0):
         conn.close()
         raise HTTPException(status_code=404, detail="Chat not found")
     msgs = conn.execute(
-        "SELECT role, content, citations, charts, created_at  "
+        "SELECT role, content, citations, charts, web_search, created_at "
         "FROM messages WHERE chat_id = ? ORDER BY id",
         (chat_id,),
     ).fetchall()
@@ -93,7 +96,7 @@ def export_chat(chat_id: int, tz: int = 0):
 def get_messages(chat_id: int):
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, role, content, citations, charts, created_at "
+        "SELECT id, role, content, citations, charts, web_search, created_at "
         "FROM messages WHERE chat_id = ? ORDER BY id",
         (chat_id,),
     ).fetchall()
@@ -112,8 +115,9 @@ def send_message(chat_id: int, body: ChatRequest):
 
     # 1. save the user's message
     conn.execute(
-        "INSERT INTO messages (chat_id, role, content) VALUES (?, 'user', ?)",
-        (chat_id, body.content),
+        "INSERT INTO messages (chat_id, role, content, web_search) "
+        "VALUES (?, 'user', ?, ?)",
+        (chat_id, body.content, int(body.web_search)),
     )
     if chat["title"] == "New chat":
         conn.execute(
@@ -140,20 +144,21 @@ def send_message(chat_id: int, body: ChatRequest):
 
     # 3. run the agent (tools + citations)
     try:
-        result = run_agent(conn, history)
+        result = run_agent(conn, history, body.web_search)
     except Exception as e:
         conn.close()
         raise HTTPException(status_code=502, detail=f"LLM error: {e}")
 
     # 4. save and return the answer with its citations and charts
     cur = conn.execute(
-        "INSERT INTO messages (chat_id, role, content, citations, charts) "
-        "VALUES (?, 'assistant', ?, ?, ?)",
+        "INSERT INTO messages (chat_id, role, content, citations, charts, web_search) "
+        "VALUES (?, 'assistant', ?, ?, ?, ?)",
         (
             chat_id,
             result["answer"],
             json.dumps(result["citations"]),
             json.dumps(result["charts"]),
+            int(body.web_search),
         ),
     )
     msg_id = cur.lastrowid
@@ -165,6 +170,7 @@ def send_message(chat_id: int, body: ChatRequest):
         "content": result["answer"],
         "citations": result["citations"],
         "charts": result["charts"],
+        "web_search": body.web_search,
     }
 
 ALLOWED_TYPES = {
@@ -341,7 +347,7 @@ def search_test(q: str, top_k: int = 6):
         return search_documents(conn, q, top_k)
     finally:
         conn.close()
-        
+
 @app.get("/messages/{message_id}/charts/{index}")
 def chart_image(message_id: int, index: int):
     conn = get_conn()

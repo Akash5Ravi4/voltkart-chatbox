@@ -4,6 +4,7 @@ import re
 from app.llm import get_client, MODEL
 from app.search import search_documents
 from app.tables import describe_tables, run_query
+from app.web import search_web
 
 MAX_STEPS = 6            # max tool-calling rounds per question
 MAX_ROWS_TO_LLM = 100    # rows the LLM sees from one query
@@ -88,10 +89,51 @@ TOOLS = [
         },
     },
 ]
+WEB_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the public web. Use it only for facts that are not in the "
+            "uploaded tables or documents, such as another company's policy or "
+            "current public information. Returns titles, URLs and snippets."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "A short search query."}
+            },
+            "required": ["query"],
+        },
+    },
+}
 
-RULES = """You are a assistant that answers questions using ONLY the user's uploaded
-tables and documents, through two tools: query_tables and search_documents.
-Never use outside knowledge and never browse the web.
+WEB_ON = """
+WEB SEARCH IS ON for this message
+- You also have a web_search tool. Use it for facts that are not in the
+  uploaded files (for example another company's policy or current public
+  information).
+- Questions about the uploaded tables and documents are still answered from
+  them. Do not use the web for those.
+- When you combine sources, say clearly which facts came from the uploaded
+  files and which came from the web, and cite each with its label
+  ([T#], [D#] or [W#]).
+- Web results can be wrong or out of date. Prefer official pages, name the
+  source in your answer, and say so if sources disagree or you could not
+  confirm a fact.
+"""
+
+WEB_OFF = """
+WEB SEARCH IS OFF for this message
+- You have no web access. If a question needs information that is not in the
+  uploaded files (for example another company's policy), say that it is not in
+  the uploaded files, that web search is off, and that the user can turn it
+  on. Do not answer from memory.
+"""
+
+RULES = """You are an assistant that answers questions using ONLY what your tools return:
+the user's uploaded tables and documents, and the web only when web search is
+turned on for the message. Never use outside knowledge  .
 
 HOW TO WORK
 - Numbers, counts, totals and rankings come from query_tables. Never calculate
@@ -126,8 +168,8 @@ STAYING HONEST
 
 CITATIONS (required)
 - Every fact must be followed by the reference label of the source that supports
-  it: [T1] for a table result, [D3] for a document passage. Use the exact labels
-  from the tool results. Combine as [D1][D2] when needed.
+it: [T1] for a table result, [D3] for a document passage, [W2] for a web
+  result. Use the exact labels from the tool results. Combine as [D1][W1] when needed..
 - Do not invent labels. Do not cite anything you did not use.
 - An answer saying the information was not found needs no citation.
 
@@ -144,7 +186,7 @@ def _short(v, n=40):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def build_system_prompt(conn) -> tuple[str, list[str]]:
+def build_system_prompt(conn, web_search: bool = False) -> tuple[str, list[str]]:
     tables = describe_tables(sample_rows=2)
     names = [t["table_name"] for t in tables]
 
@@ -173,7 +215,8 @@ def build_system_prompt(conn) -> tuple[str, list[str]]:
     else:
         docs_text = "UPLOADED DOCUMENTS: none."
 
-    return f"{RULES}\n{tables_text}\n\n{docs_text}", names
+    web_text = WEB_ON if web_search else WEB_OFF
+    return f"{RULES}\n{web_text}\n{tables_text}\n\n{docs_text}", names
 
 
 # ---------------------------------------------------------------- tools
@@ -296,13 +339,38 @@ def _exec_tool(name: str, args: dict, state: dict, conn) -> str:
         )
         return (f"Chart created from [{ref}] and will appear under your answer. "
                 f"Cite [{ref}] in your reply.")
-
+    
+    if name == "web_search":
+        if not state["web"]:
+            return "Web search is turned off for this message."
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return "Give a search query."
+        try:
+            results = search_web(query)
+        except Exception as e:
+            return f"Web search failed: {e}"
+        if not results:
+            return "The web search returned no results."
+        lines = []
+        for r in results:
+            state["w"] += 1
+            ref = f"W{state['w']}"
+            state["cites"][ref] = {
+                "type": "web",
+                "title": r["title"],
+                "url": r["url"],
+                "text": r["content"][:600],
+            }
+            lines.append(f'[{ref}] {r["title"]} | {r["url"]}\n{r["content"][:1200]}')
+        return "\n\n".join(lines)
+    
     return f"Unknown tool: {name}"
 
 
 # ---------------------------------------------------------------- citations
 
-MARK = re.compile(r"\[([DT]\d+(?:\s*,\s*[DT]\d+)*)\]")
+MARK = re.compile(r"\[([DTW]\d+(?:\s*,\s*[DTW]\d+)*)\]")
 OLD_MARK = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
 
 
@@ -343,14 +411,14 @@ def finalize(answer: str, cites: dict, extra_refs=()) -> tuple[str, list[dict], 
 
 # ---------------------------------------------------------------- the loop
 
-def _chat(client, messages):
+def _chat(client, messages, tools):
     last = None
     for _ in range(2):  # one retry: tool-call formatting glitches do happen
         try:
             return client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
-                tools=TOOLS,
+                tools=tools,
                 tool_choice="auto",
                 temperature=0,
             )
@@ -359,18 +427,19 @@ def _chat(client, messages):
     raise last
 
 
-def run_agent(conn, history: list[dict]) -> dict:
+def run_agent(conn, history: list[dict], web_search: bool = False) -> dict:
     client = get_client()
-    prompt, table_names = build_system_prompt(conn)
+    prompt, table_names = build_system_prompt(conn, web_search)
+    tools = TOOLS + [WEB_TOOL] if web_search else TOOLS
     state = {
-        "t": 0, "d": 0, "cites": {}, "results": {}, "charts": [],
-        "table_names": table_names,
+        "t": 0, "d": 0, "w": 0, "cites": {}, "results": {}, "charts": [],
+        "table_names": table_names, "web": web_search,
     }
     messages = [{"role": "system", "content": prompt}] + history
 
     answer = None
     for _ in range(MAX_STEPS):
-        msg = _chat(client, messages).choices[0].message
+        msg = _chat(client, messages, tools).choices[0].message
         if not msg.tool_calls:
             answer = msg.content or ""
             break
