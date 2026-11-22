@@ -3,3 +3,7 @@ uvicorn
 python-multipart
 python-dotenv
 groq
+duckdb
+pymupdf
+python-docx
+python-dateutil

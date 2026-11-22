@@ -3,6 +3,7 @@ from pathlib import Path
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = DATA_DIR / "app.db"
+UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 
 
 def get_conn() -> sqlite3.Connection:
@@ -32,7 +33,41 @@ def init_db() -> None:
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS files (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,         -- original file name
+            file_type   TEXT NOT NULL,         -- csv, pdf, docx, txt
+            size_bytes  INTEGER NOT NULL,
+            stored_path TEXT NOT NULL,
+            uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS csv_tables (
+            file_id    INTEGER PRIMARY KEY,
+            table_name TEXT NOT NULL,
+            row_count  INTEGER NOT NULL,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS documents (
+            file_id       INTEGER PRIMARY KEY,
+            family        TEXT NOT NULL,
+            doc_date      TEXT,              -- the date we use (YYYY-MM-DD)
+            filename_date TEXT,
+            body_date     TEXT,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS chunks (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id     INTEGER NOT NULL,
+            location    TEXT NOT NULL,       -- 'Page 2' or a section heading
+            chunk_index INTEGER NOT NULL,
+            text        TEXT NOT NULL,
+            FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
         """
     )
     conn.commit()
     conn.close()
+     
