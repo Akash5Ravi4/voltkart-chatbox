@@ -52,6 +52,41 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "make_chart",
+            "description": (
+                "Draw a bar, line or pie chart from the rows of an earlier "
+                "query_tables result. The chart is shown automatically under your "
+                "answer. Never type data values yourself: they are read from the query."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Label of the query result to plot, e.g. T1.",
+                    },
+                    "chart_type": {"type": "string", "enum": ["bar", "line", "pie"]},
+                    "x_column": {
+                        "type": "string",
+                        "description": "Column for the categories / x axis (pie: slice names).",
+                    },
+                    "y_columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Numeric column(s) to plot (pie: exactly one).",
+                    },
+                    "title": {"type": "string"},
+                    "x_label": {"type": "string"},
+                    "y_label": {"type": "string"},
+                },
+                "required": ["source", "chart_type", "x_column", "y_columns",
+                             "title", "x_label", "y_label"],
+            },
+        },
+    },
 ]
 
 RULES = """You are a assistant that answers questions using ONLY the user's uploaded
@@ -158,6 +193,7 @@ def _exec_tool(name: str, args: dict, state: dict, conn) -> str:
         state["t"] += 1
         ref = f"T{state['t']}"
         rows = json.loads(json.dumps(res["rows"], default=str))  # make JSON-safe
+        state["results"][ref] = {"columns": res["columns"], "rows": rows}
         state["cites"][ref] = {
             "type": "table",
             "tables": _tables_in_sql(res["sql"], state["table_names"]),
@@ -201,6 +237,66 @@ def _exec_tool(name: str, args: dict, state: dict, conn) -> str:
             )
         return "\n\n".join(lines)
 
+    if name == "make_chart":
+        ref = str(args.get("source", "")).strip().strip("[]").upper()
+        src = state["results"].get(ref)
+        if src is None:
+            return (f"No query result is labelled '{ref}'. Run query_tables first "
+                    "and use its label (for example T1).")
+
+        chart_type = str(args.get("chart_type", "")).lower()
+        if chart_type not in ("bar", "line", "pie"):
+            return "chart_type must be bar, line or pie."
+
+        cols, rows = src["columns"], src["rows"]
+        if not rows:
+            return "That query returned no rows, so there is nothing to plot."
+        lookup = {c.lower(): c for c in cols}
+
+        x = lookup.get(str(args.get("x_column", "")).lower())
+        ys_raw = args.get("y_columns") or []
+        if isinstance(ys_raw, str):
+            ys_raw = [ys_raw]
+        ys = [lookup.get(str(y).lower()) for y in ys_raw]
+        if x is None or not ys or None in ys:
+            return f"Unknown column. The columns of {ref} are: {', '.join(cols)}."
+
+        limit = 30 if chart_type == "pie" else 30
+        if len(rows) > limit:
+            return (f"{ref} has {len(rows)} rows, too many for a {chart_type} "
+                    f"chart (max {limit}). Re-run the query with LIMIT or "
+                    "aggregate it, then call make_chart again.")
+
+        xi = cols.index(x)
+        labels = [str(r[xi]) for r in rows]
+        series = []
+        for y in ys:
+            yi = cols.index(y)
+            try:
+                vals = [float(r[yi]) for r in rows]
+            except (TypeError, ValueError):
+                return f"Column '{y}' is not numeric, so it can't be plotted."
+            series.append({"name": y, "values": vals})
+
+        if chart_type == "pie":
+            series = series[:1]
+            if any(v < 0 for v in series[0]["values"]):
+                return "A pie chart can't show negative values. Use a bar chart."
+
+        state["charts"].append(
+            {
+                "chart_type": chart_type,
+                "title": str(args.get("title") or "Chart"),
+                "x_label": str(args.get("x_label") or x),
+                "y_label": str(args.get("y_label") or ys[0]),
+                "labels": labels,
+                "series": series,
+                "source_ref": ref,
+            }
+        )
+        return (f"Chart created from [{ref}] and will appear under your answer. "
+                f"Cite [{ref}] in your reply.")
+
     return f"Unknown tool: {name}"
 
 
@@ -215,8 +311,9 @@ def strip_markers(text: str) -> str:
     return OLD_MARK.sub("", text)
 
 
-def finalize(answer: str, cites: dict) -> tuple[str, list[dict]]:
-    """Keep only the sources the answer used, renumbered 1..n."""
+def finalize(answer: str, cites: dict, extra_refs=()) -> tuple[str, list[dict], dict]:
+    """Keep only the sources the answer used, renumbered 1..n.
+    extra_refs are always kept (a chart's data source, even if the model forgot to cite it)."""
     order: list[str] = []
 
     def repl(m):
@@ -230,12 +327,18 @@ def finalize(answer: str, cites: dict) -> tuple[str, list[dict]]:
         return f"[{', '.join(nums)}]" if nums else ""
 
     text = MARK.sub(repl, answer)
+    for ref in extra_refs:
+        if ref in cites and ref not in order:
+            order.append(ref)
+
     citations = []
+    numbers = {}
     for i, ref in enumerate(order, start=1):
         c = dict(cites[ref])
         c["ref"] = i
         citations.append(c)
-    return text, citations
+        numbers[ref] = i
+    return text, citations, numbers
 
 
 # ---------------------------------------------------------------- the loop
@@ -259,7 +362,10 @@ def _chat(client, messages):
 def run_agent(conn, history: list[dict]) -> dict:
     client = get_client()
     prompt, table_names = build_system_prompt(conn)
-    state = {"t": 0, "d": 0, "cites": {}, "table_names": table_names}
+    state = {
+        "t": 0, "d": 0, "cites": {}, "results": {}, "charts": [],
+        "table_names": table_names,
+    }
     messages = [{"role": "system", "content": prompt}] + history
 
     answer = None
@@ -302,5 +408,12 @@ def run_agent(conn, history: list[dict]) -> dict:
             "Please try rephrasing or splitting the question."
         )
 
-    text, citations = finalize(answer, state["cites"])
-    return {"answer": text, "citations": citations}
+    text, citations, numbers = finalize(
+        answer, state["cites"], [c["source_ref"] for c in state["charts"]]
+    )
+    charts = []
+    for c in state["charts"]:
+        spec = dict(c)
+        spec["cite"] = numbers.get(spec.pop("source_ref"))  # which [n] is its source
+        charts.append(spec)
+    return {"answer": text, "citations": citations, "charts": charts}

@@ -2,8 +2,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import json
+import re
 
 load_dotenv()  # load .env before the app modules run
 
@@ -14,6 +19,8 @@ from app.tables import (
 )
 from app.docs import ingest_document
 from app.search import search_documents, embed_missing
+from app.export import build_chat_pdf
+from app.charts import render_chart
 
 init_db()
 
@@ -48,12 +55,45 @@ def list_chats():
     conn.close()
     return [dict(r) for r in rows]
 
+@app.delete("/chats/{chat_id}")
+def delete_chat(chat_id: int):
+    conn = get_conn()
+    cur = conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    return {"deleted": chat_id}
+
+@app.get("/chats/{chat_id}/export")
+def export_chat(chat_id: int, tz: int = 0):
+    """tz = the browser's UTC offset in minutes (e.g. 330 for India)."""
+    conn = get_conn()
+    chat = conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
+    if chat is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Chat not found")
+    msgs = conn.execute(
+        "SELECT role, content, citations, charts, created_at  "
+        "FROM messages WHERE chat_id = ? ORDER BY id",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+
+    pdf = build_chat_pdf(dict(chat), [dict(m) for m in msgs], tz)
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", chat["title"] or "chat")[:40].strip("_") or "chat"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="chat_{chat_id}_{safe}.pdf"'},
+    )
 
 @app.get("/chats/{chat_id}/messages")
 def get_messages(chat_id: int):
     conn = get_conn()
     rows = conn.execute(
-        "SELECT id, role, content, citations, created_at "
+        "SELECT id, role, content, citations, charts, created_at "
         "FROM messages WHERE chat_id = ? ORDER BY id",
         (chat_id,),
     ).fetchall()
@@ -105,18 +145,26 @@ def send_message(chat_id: int, body: ChatRequest):
         conn.close()
         raise HTTPException(status_code=502, detail=f"LLM error: {e}")
 
-    # 4. save and return the answer with its citations
-    conn.execute(
-        "INSERT INTO messages (chat_id, role, content, citations) "
-        "VALUES (?, 'assistant', ?, ?)",
-        (chat_id, result["answer"], json.dumps(result["citations"])),
+    # 4. save and return the answer with its citations and charts
+    cur = conn.execute(
+        "INSERT INTO messages (chat_id, role, content, citations, charts) "
+        "VALUES (?, 'assistant', ?, ?, ?)",
+        (
+            chat_id,
+            result["answer"],
+            json.dumps(result["citations"]),
+            json.dumps(result["charts"]),
+        ),
     )
+    msg_id = cur.lastrowid
     conn.commit()
     conn.close()
     return {
+        "id": msg_id,
         "role": "assistant",
         "content": result["answer"],
         "citations": result["citations"],
+        "charts": result["charts"],
     }
 
 ALLOWED_TYPES = {
@@ -126,6 +174,7 @@ ALLOWED_TYPES = {
     ".txt": "txt",
     ".md": "txt",  # treated as plain text
 }
+
 
 
 def remove_file(conn, file_id: int) -> bool:
@@ -292,3 +341,25 @@ def search_test(q: str, top_k: int = 6):
         return search_documents(conn, q, top_k)
     finally:
         conn.close()
+        
+@app.get("/messages/{message_id}/charts/{index}")
+def chart_image(message_id: int, index: int):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT charts FROM messages WHERE id = ?", (message_id,)
+    ).fetchone()
+    conn.close()
+    try:
+        spec = json.loads(row["charts"])[index]
+    except (TypeError, ValueError, IndexError, KeyError):
+        raise HTTPException(status_code=404, detail="Chart not found")
+    return Response(content=render_chart(spec), media_type="image/png")
+FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
+
+
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(FRONTEND_DIR / "index.html")
+
+
+app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")

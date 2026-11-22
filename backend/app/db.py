@@ -71,6 +71,10 @@ def init_db() -> None:
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()]
     if "embedding" not in cols:
         conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB")
+    mcols = [r["name"] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    if "charts" not in mcols:
+        conn.execute("ALTER TABLE messages ADD COLUMN charts TEXT")
+
     conn.commit()
     conn.close()
      
