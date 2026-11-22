@@ -3,11 +3,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
+import json
 
 load_dotenv()  # load .env before the app modules run
 
 from app.db import get_conn, init_db, UPLOAD_DIR
-from app.llm import ask_llm
+from app.agent import run_agent, strip_markers
 from app.tables import (
     make_table_name, load_csv, drop_table, describe_tables, run_query,
 )
@@ -74,7 +75,6 @@ def send_message(chat_id: int, body: ChatRequest):
         "INSERT INTO messages (chat_id, role, content) VALUES (?, 'user', ?)",
         (chat_id, body.content),
     )
-    # name the chat after its first message
     if chat["title"] == "New chat":
         conn.execute(
             "UPDATE chats SET title = ? WHERE id = ?",
@@ -88,23 +88,36 @@ def send_message(chat_id: int, body: ChatRequest):
         "ORDER BY id DESC LIMIT ?",
         (chat_id, HISTORY_LIMIT),
     ).fetchall()
-    history = [dict(r) for r in reversed(rows)]
+    history = [
+        {
+            "role": r["role"],
+            "content": strip_markers(r["content"])
+            if r["role"] == "assistant"
+            else r["content"],
+        }
+        for r in reversed(rows)
+    ]
 
-    # 3. ask the LLM
+    # 3. run the agent (tools + citations)
     try:
-        answer = ask_llm(history)
+        result = run_agent(conn, history)
     except Exception as e:
         conn.close()
         raise HTTPException(status_code=502, detail=f"LLM error: {e}")
 
-    # 4. save and return the answer
+    # 4. save and return the answer with its citations
     conn.execute(
-        "INSERT INTO messages (chat_id, role, content) VALUES (?, 'assistant', ?)",
-        (chat_id, answer),
+        "INSERT INTO messages (chat_id, role, content, citations) "
+        "VALUES (?, 'assistant', ?, ?)",
+        (chat_id, result["answer"], json.dumps(result["citations"])),
     )
     conn.commit()
     conn.close()
-    return {"role": "assistant", "content": answer}
+    return {
+        "role": "assistant",
+        "content": result["answer"],
+        "citations": result["citations"],
+    }
 
 ALLOWED_TYPES = {
     ".csv": "csv",
@@ -209,17 +222,6 @@ async def upload_file(file: UploadFile = File(...)):
     conn.close()
     return result    
 
-    if file_type in ("pdf", "docx", "txt"):
-        try:
-            info = ingest_document(conn, file_id, stored_path, file_type, safe_name)
-            conn.commit()
-        except Exception as e:
-            remove_file(conn, file_id)
-            conn.close()
-            raise HTTPException(status_code=400, detail=f"Could not read document: {e}")
-        result.update(info)
-    conn.close()
-    return result
 
 @app.get("/files")
 def list_files():

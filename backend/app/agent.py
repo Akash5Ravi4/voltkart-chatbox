@@ -1,0 +1,306 @@
+import json
+import re
+
+from app.llm import get_client, MODEL
+from app.search import search_documents
+from app.tables import describe_tables, run_query
+
+MAX_STEPS = 6            # max tool-calling rounds per question
+MAX_ROWS_TO_LLM = 100    # rows the LLM sees from one query
+MAX_ROWS_IN_CITATION = 25  # rows saved in the citation preview
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "query_tables",
+            "description": (
+                "Run a read-only DuckDB SQL SELECT on the uploaded CSV tables. "
+                "Use it for every number, count, total, ranking or lookup that "
+                "lives in the tables. Joins across tables are allowed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "One SELECT (or WITH ... SELECT) statement.",
+                    }
+                },
+                "required": ["sql"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_documents",
+            "description": (
+                "Search the uploaded documents (policies, job descriptions, terms, "
+                "notices, data dictionaries). Returns passages from ALL versions, "
+                "each with file name, date, section and a latest/superseded status."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to look for, in plain words.",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+RULES = """You are a assistant that answers questions using ONLY the user's uploaded
+tables and documents, through two tools: query_tables and search_documents.
+Never use outside knowledge and never browse the web.
+
+HOW TO WORK
+- Numbers, counts, totals and rankings come from query_tables. Never calculate
+  or estimate in your head. Write DuckDB SQL (double-quote identifiers if needed;
+  use CAST or strptime if a date column is stored as text) and report the values
+  exactly as returned.
+- If a question depends on a business definition (for example what counts as
+  revenue, or what a status means), call search_documents for the definition
+  first, then write the SQL.
+- Policy, rules, job details and terms come from search_documents.
+- Questions that mix both (for example "is this order's return allowed?") need
+  both tools: look up the order data, then look up the rule, then combine them.
+- Follow-up questions ("that store", "the second one") refer to earlier turns of
+  this conversation. Resolve them from the conversation before using tools.
+
+DOCUMENT VERSIONS
+- Each passage is marked latest (newest version of that document) or
+  superseded (a newer version exists).
+- Decide fact by fact. Use the newest version that actually states the fact.
+  If the newest version says nothing about it, you may use an older version,
+  but you must say so in the answer: name the file and its date.
+- If versions disagree, give the newest version's value and do not mix numbers
+  from different versions.
+- "latest" does not mean the passage contains the answer. Read the text.
+
+STAYING HONEST
+- Check that a passage or result is really about what was asked. A passage about
+  one company, product or role does not answer a question about another.
+- If the sources do not contain the answer, say clearly that you could not find
+  it in the uploaded files. Do not guess and do not substitute a related fact.
+- If the tools return nothing useful, say so plainly.
+
+CITATIONS (required)
+- Every fact must be followed by the reference label of the source that supports
+  it: [T1] for a table result, [D3] for a document passage. Use the exact labels
+  from the tool results. Combine as [D1][D2] when needed.
+- Do not invent labels. Do not cite anything you did not use.
+- An answer saying the information was not found needs no citation.
+
+STYLE
+- Be concise and direct. Use a markdown table when listing several rows.
+- Lead with the answer, then add short supporting detail.
+"""
+
+
+# ---------------------------------------------------------------- prompt
+
+def _short(v, n=40):
+    s = str(v)
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def build_system_prompt(conn) -> tuple[str, list[str]]:
+    tables = describe_tables(sample_rows=2)
+    names = [t["table_name"] for t in tables]
+
+    if tables:
+        parts = ["UPLOADED TABLES (DuckDB):"]
+        for t in tables:
+            cols = ", ".join(f'{c["name"]} {c["type"]}' for c in t["columns"])
+            parts.append(f'- {t["table_name"]} ({t["row_count"]} rows): {cols}')
+            for row in t["sample_rows"]:
+                parts.append(
+                    "    sample: " + json.dumps({k: _short(v) for k, v in row.items()})
+                )
+        tables_text = "\n".join(parts)
+    else:
+        tables_text = "UPLOADED TABLES: none."
+
+    docs = conn.execute(
+        "SELECT f.name, d.family, d.doc_date FROM documents d "
+        "JOIN files f ON f.id = d.file_id ORDER BY d.family, d.doc_date"
+    ).fetchall()
+    if docs:
+        docs_text = "UPLOADED DOCUMENTS:\n" + "\n".join(
+            f'- {d["name"]} (family: {d["family"]}, date: {d["doc_date"] or "unknown"})'
+            for d in docs
+        )
+    else:
+        docs_text = "UPLOADED DOCUMENTS: none."
+
+    return f"{RULES}\n{tables_text}\n\n{docs_text}", names
+
+
+# ---------------------------------------------------------------- tools
+
+def _tables_in_sql(sql: str, names: list[str]) -> list[str]:
+    low = sql.lower()
+    return [n for n in names if re.search(rf"\b{re.escape(n.lower())}\b", low)]
+
+
+def _exec_tool(name: str, args: dict, state: dict, conn) -> str:
+    if name == "query_tables":
+        sql = str(args.get("sql", ""))
+        try:
+            res = run_query(sql)
+        except Exception as e:
+            return f"SQL error: {e}. Fix the query and try again."
+        state["t"] += 1
+        ref = f"T{state['t']}"
+        rows = json.loads(json.dumps(res["rows"], default=str))  # make JSON-safe
+        state["cites"][ref] = {
+            "type": "table",
+            "tables": _tables_in_sql(res["sql"], state["table_names"]),
+            "sql": res["sql"],
+            "columns": res["columns"],
+            "rows": rows[:MAX_ROWS_IN_CITATION],
+            "row_count": len(rows),
+        }
+        shown = rows[:MAX_ROWS_TO_LLM]
+        note = f" (showing first {len(shown)})" if len(rows) > len(shown) else ""
+        return (
+            f"[{ref}] Query ran OK. {len(rows)} row(s){note}.\n"
+            + json.dumps({"columns": res["columns"], "rows": shown})
+        )
+
+    if name == "search_documents":
+        query = str(args.get("query", ""))
+        results = search_documents(conn, query, top_k=6)
+        if not results:
+            return "No documents are uploaded."
+        lines = []
+        for r in results:
+            state["d"] += 1
+            ref = f"D{state['d']}"
+            state["cites"][ref] = {
+                "type": "document",
+                "file_name": r["file_name"],
+                "doc_date": r["doc_date"],
+                "location": r["location"],
+                "status": r["status"],
+                "family": r["family"],
+                "text": r["text"],
+            }
+            status = (
+                "latest version" if r["status"] == "latest"
+                else "superseded: a newer version exists"
+            )
+            lines.append(
+                f'[{ref}] file: {r["file_name"]} | date: {r["doc_date"]} | '
+                f'section: {r["location"]} | {status}\n{r["text"]}'
+            )
+        return "\n\n".join(lines)
+
+    return f"Unknown tool: {name}"
+
+
+# ---------------------------------------------------------------- citations
+
+MARK = re.compile(r"\[([DT]\d+(?:\s*,\s*[DT]\d+)*)\]")
+OLD_MARK = re.compile(r"\s*\[\d+(?:\s*,\s*\d+)*\]")
+
+
+def strip_markers(text: str) -> str:
+    """Remove [1], [2, 3] markers (used when sending past answers back to the LLM)."""
+    return OLD_MARK.sub("", text)
+
+
+def finalize(answer: str, cites: dict) -> tuple[str, list[dict]]:
+    """Keep only the sources the answer used, renumbered 1..n."""
+    order: list[str] = []
+
+    def repl(m):
+        nums = []
+        for ref in re.split(r"\s*,\s*", m.group(1)):
+            if ref not in cites:
+                continue  # the model invented a label: drop it
+            if ref not in order:
+                order.append(ref)
+            nums.append(str(order.index(ref) + 1))
+        return f"[{', '.join(nums)}]" if nums else ""
+
+    text = MARK.sub(repl, answer)
+    citations = []
+    for i, ref in enumerate(order, start=1):
+        c = dict(cites[ref])
+        c["ref"] = i
+        citations.append(c)
+    return text, citations
+
+
+# ---------------------------------------------------------------- the loop
+
+def _chat(client, messages):
+    last = None
+    for _ in range(2):  # one retry: tool-call formatting glitches do happen
+        try:
+            return client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0,
+            )
+        except Exception as e:
+            last = e
+    raise last
+
+
+def run_agent(conn, history: list[dict]) -> dict:
+    client = get_client()
+    prompt, table_names = build_system_prompt(conn)
+    state = {"t": 0, "d": 0, "cites": {}, "table_names": table_names}
+    messages = [{"role": "system", "content": prompt}] + history
+
+    answer = None
+    for _ in range(MAX_STEPS):
+        msg = _chat(client, messages).choices[0].message
+        if not msg.tool_calls:
+            answer = msg.content or ""
+            break
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            }
+        )
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result = _exec_tool(tc.function.name, args, state, conn)
+            messages.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": result}
+            )
+
+    if answer is None:
+        answer = (
+            "I couldn't finish working this out. "
+            "Please try rephrasing or splitting the question."
+        )
+
+    text, citations = finalize(answer, state["cites"])
+    return {"answer": text, "citations": citations}
